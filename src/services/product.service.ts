@@ -3,13 +3,43 @@ import { z } from "zod";
 import { HttpError } from "../lib/http.js";
 import { prisma } from "../lib/prisma.js";
 
+export const imageUrlSchema = z
+  .string()
+  .trim()
+  .max(1_000_000)
+  .refine((value) => /^https?:\/\//.test(value) || /^data:image\/(png|jpe?g|webp);base64,/.test(value), {
+    message: "Image must be a URL or data image"
+  });
+
+export const quantityPriceRangeSchema = z.object({
+  id: z.string().optional(),
+  from: z.coerce.number().int().min(1).max(99999),
+  to: z.coerce.number().int().min(1).max(99999).nullable().optional(),
+  price: z.coerce.number().positive().max(99999999)
+});
+
 export const productSchema = z.object({
   name: z.string().trim().min(2).max(120),
   description: z.string().trim().min(5).max(1000),
   price: z.coerce.number().positive().max(99999999),
   promotionalPrice: z.coerce.number().positive().max(99999999).nullable().optional(),
+  quantityPrices: z
+    .array(quantityPriceRangeSchema)
+    .max(20)
+    .default([])
+    .superRefine((ranges, context) => {
+      for (const range of ranges) {
+        if (range.to !== null && range.to !== undefined && range.to < range.from) {
+          context.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: "Range end must be greater than or equal to range start",
+            path: ["to"]
+          });
+        }
+      }
+    }),
   stock: z.coerce.number().int().min(0).max(999999),
-  imageUrl: z.string().trim().url().max(1000),
+  imageUrl: imageUrlSchema,
   categoryId: z.string().min(1),
   brandId: z.string().min(1)
 });
@@ -31,9 +61,10 @@ export const productQuerySchema = z.object({
 });
 
 const productInclude = {
-  category: { select: { id: true, name: true, slug: true } },
-  brand: { select: { id: true, name: true, slug: true } },
-  owner: { select: { id: true, name: true } }
+  category: { select: { id: true, name: true, slug: true, imageUrl: true, departmentId: true } },
+  brand: { select: { id: true, name: true, slug: true, imageUrl: true } },
+  owner: { select: { id: true, name: true } },
+  quantityPrices: { orderBy: { from: "asc" } }
 } satisfies Prisma.ProductInclude;
 
 type ProductWithRelations = Prisma.ProductGetPayload<{ include: typeof productInclude }>;
@@ -43,8 +74,20 @@ function mapProduct(product: ProductWithRelations) {
     ...product,
     price: Number(product.price),
     promotionalPrice: product.promotionalPrice ? Number(product.promotionalPrice) : null,
-    effectivePrice: Number(product.promotionalPrice ?? product.price)
+    effectivePrice: Number(product.promotionalPrice ?? product.price),
+    quantityPrices: product.quantityPrices.map((range) => ({
+      ...range,
+      price: Number(range.price)
+    }))
   };
+}
+
+export function effectiveProductPrice(
+  product: { price: unknown; promotionalPrice: unknown; quantityPrices?: Array<{ from: number; to: number | null; price: unknown }> },
+  quantity = 1
+) {
+  const quantityRange = product.quantityPrices?.find((range) => quantity >= range.from && (range.to === null || quantity <= range.to));
+  return Number(quantityRange?.price ?? product.promotionalPrice ?? product.price);
 }
 
 export async function listProducts(query: unknown) {
@@ -126,7 +169,14 @@ export async function createProduct(ownerId: string, input: unknown) {
       imageUrl: data.imageUrl,
       categoryId: data.categoryId,
       brandId: data.brandId,
-      ownerId
+      ownerId,
+      quantityPrices: {
+        create: data.quantityPrices.map((range) => ({
+          from: range.from,
+          to: range.to ?? null,
+          price: range.price
+        }))
+      }
     },
     include: productInclude
   });
@@ -148,19 +198,29 @@ export async function updateProduct(ownerId: string, id: string, input: unknown)
 
   await assertCategoryAndBrand(data.categoryId, data.brandId);
 
-  const product = await prisma.product.update({
-    where: { id },
-    data: {
-      name: data.name,
-      description: data.description,
-      price: data.price,
-      promotionalPrice: data.promotionalPrice ?? null,
-      stock: data.stock,
-      imageUrl: data.imageUrl,
-      categoryId: data.categoryId,
-      brandId: data.brandId
-    },
-    include: productInclude
+  const product = await prisma.$transaction(async (tx) => {
+    await tx.quantityPriceRange.deleteMany({ where: { productId: id } });
+    return tx.product.update({
+      where: { id },
+      data: {
+        name: data.name,
+        description: data.description,
+        price: data.price,
+        promotionalPrice: data.promotionalPrice ?? null,
+        stock: data.stock,
+        imageUrl: data.imageUrl,
+        categoryId: data.categoryId,
+        brandId: data.brandId,
+        quantityPrices: {
+          create: data.quantityPrices.map((range) => ({
+            from: range.from,
+            to: range.to ?? null,
+            price: range.price
+          }))
+        }
+      },
+      include: productInclude
+    });
   });
 
   return mapProduct(product);

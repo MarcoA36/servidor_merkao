@@ -13,6 +13,9 @@ categoryRouter.get(
         id: true,
         name: true,
         slug: true,
+        imageUrl: true,
+        departmentId: true,
+        department: { select: { id: true, name: true, slug: true } },
         _count: { select: { products: { where: { isActive: true } } } }
       }
     });
@@ -22,6 +25,9 @@ categoryRouter.get(
         id: category.id,
         name: category.name,
         slug: category.slug,
+        imageUrl: category.imageUrl,
+        departmentId: category.departmentId,
+        department: category.department,
         productCount: category._count.products
       }))
     });

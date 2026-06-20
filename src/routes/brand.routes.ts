@@ -13,6 +13,7 @@ brandRouter.get(
         id: true,
         name: true,
         slug: true,
+        imageUrl: true,
         _count: { select: { products: { where: { isActive: true } } } }
       }
     });
@@ -22,6 +23,7 @@ brandRouter.get(
         id: brand.id,
         name: brand.name,
         slug: brand.slug,
+        imageUrl: brand.imageUrl,
         productCount: brand._count.products
       }))
     });

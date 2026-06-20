@@ -3,12 +3,20 @@ import bcrypt from "bcryptjs";
 
 const prisma = new PrismaClient();
 
-const categories = [
+const departments = [
   { name: "Almacen", slug: "almacen" },
-  { name: "Bebidas", slug: "bebidas" },
-  { name: "Limpieza", slug: "limpieza" },
-  { name: "Perfumeria", slug: "perfumeria" },
+  { name: "Bodega", slug: "bodega" },
+  { name: "Farmacia", slug: "farmacia" },
+  { name: "Hogar", slug: "hogar" },
   { name: "Mascotas", slug: "mascotas" }
+];
+
+const categories = [
+  { name: "Almacen", slug: "almacen", departmentSlug: "almacen" },
+  { name: "Bebidas", slug: "bebidas", departmentSlug: "bodega" },
+  { name: "Limpieza", slug: "limpieza", departmentSlug: "hogar" },
+  { name: "Perfumeria", slug: "perfumeria", departmentSlug: "farmacia" },
+  { name: "Mascotas", slug: "mascotas", departmentSlug: "mascotas" }
 ];
 
 const brands = [
@@ -172,6 +180,11 @@ function productImageUrl(productName: string) {
   return `https://placehold.co/600x600/png?text=${label}&font=roboto`;
 }
 
+function catalogImageUrl(name: string) {
+  const label = encodeURIComponent(name.replace(/\s+/g, " ").trim());
+  return `https://placehold.co/240x240/png?text=${label}&font=roboto`;
+}
+
 const products: ProductSeedInput[] = Object.entries(catalogByCategory).flatMap(
   ([categorySlug, catalog]) =>
     catalog.map((item) => ({
@@ -187,19 +200,40 @@ const products: ProductSeedInput[] = Object.entries(catalogByCategory).flatMap(
 );
 
 async function main() {
+  for (const department of departments) {
+    await prisma.department.upsert({
+      where: { slug: department.slug },
+      update: department,
+      create: department
+    });
+  }
+
   for (const category of categories) {
+    const department = await prisma.department.findUniqueOrThrow({
+      where: { slug: category.departmentSlug }
+    });
+    const data = {
+      name: category.name,
+      slug: category.slug,
+      imageUrl: catalogImageUrl(category.name),
+      departmentId: department.id
+    };
     await prisma.category.upsert({
       where: { slug: category.slug },
-      update: category,
-      create: category
+      update: data,
+      create: data
     });
   }
 
   for (const brand of brands) {
+    const data = {
+      ...brand,
+      imageUrl: catalogImageUrl(brand.name)
+    };
     await prisma.brand.upsert({
       where: { slug: brand.slug },
-      update: brand,
-      create: brand
+      update: data,
+      create: data
     });
   }
 

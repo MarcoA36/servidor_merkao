@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { HttpError } from "../lib/http.js";
 import { prisma } from "../lib/prisma.js";
+import { effectiveProductPrice } from "./product.service.js";
 
 export const cartItemSchema = z.object({
   productId: z.string().min(1),
@@ -16,18 +17,15 @@ const cartInclude = {
     include: {
       category: { select: { id: true, name: true, slug: true } },
       brand: { select: { id: true, name: true, slug: true } },
-      owner: { select: { id: true, name: true } }
+      owner: { select: { id: true, name: true } },
+      quantityPrices: { orderBy: { from: "asc" } }
     }
   }
 } as const;
 
-function effectivePrice(product: { price: unknown; promotionalPrice: unknown }) {
-  return Number(product.promotionalPrice ?? product.price);
-}
-
 function mapCart(items: Array<Awaited<ReturnType<typeof prisma.cartItem.findMany>>[number] & { product: any }>) {
   const mappedItems = items.map((item) => {
-    const unitPrice = effectivePrice(item.product);
+    const unitPrice = effectiveProductPrice(item.product, item.quantity);
     return {
       id: item.id,
       productId: item.productId,
@@ -38,7 +36,11 @@ function mapCart(items: Array<Awaited<ReturnType<typeof prisma.cartItem.findMany
         ...item.product,
         price: Number(item.product.price),
         promotionalPrice: item.product.promotionalPrice ? Number(item.product.promotionalPrice) : null,
-        effectivePrice: unitPrice
+        effectivePrice: unitPrice,
+        quantityPrices: item.product.quantityPrices.map((range: any) => ({
+          ...range,
+          price: Number(range.price)
+        }))
       }
     };
   });

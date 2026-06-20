@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { HttpError } from "../lib/http.js";
 import { prisma } from "../lib/prisma.js";
+import { effectiveProductPrice } from "./product.service.js";
 
 export const checkoutSchema = z.object({
   addressId: z.string().min(1)
@@ -29,10 +30,6 @@ const allowedTransitions = {
   CANCELLED: []
 } as const;
 
-function effectivePrice(product: { price: unknown; promotionalPrice: unknown }) {
-  return Number(product.promotionalPrice ?? product.price);
-}
-
 function mapOrder(order: any) {
   return {
     ...order,
@@ -60,7 +57,8 @@ export async function checkout(userId: string, input: unknown) {
       product: {
         include: {
           category: { select: { name: true } },
-          brand: { select: { name: true } }
+          brand: { select: { name: true } },
+          quantityPrices: { orderBy: { from: "asc" } }
         }
       }
     },
@@ -82,7 +80,7 @@ export async function checkout(userId: string, input: unknown) {
   }
 
   const subtotal = cartItems.reduce(
-    (sum, item) => sum + effectivePrice(item.product) * item.quantity,
+    (sum, item) => sum + effectiveProductPrice(item.product, item.quantity) * item.quantity,
     0
   );
 
@@ -115,7 +113,7 @@ export async function checkout(userId: string, input: unknown) {
         },
         items: {
           create: cartItems.map((item) => {
-            const unitPrice = effectivePrice(item.product);
+            const unitPrice = effectiveProductPrice(item.product, item.quantity);
             return {
               productId: item.productId,
               productName: item.product.name,
