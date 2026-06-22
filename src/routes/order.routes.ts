@@ -65,8 +65,8 @@ adminOrderRouter.use(requireAuth, requireAdmin);
 adminOrderRouter.get(
   "/orders",
   asyncHandler(async (req, res) => {
-    const orders = await listAdminOrders(req.query.includeArchived === "true");
-    res.json({ orders });
+    const result = await listAdminOrders(req.query);
+    res.json(result);
   })
 );
 
@@ -89,7 +89,8 @@ adminOrderRouter.get(
 adminOrderRouter.patch(
   "/orders/:id/status",
   asyncHandler(async (req, res) => {
-    const order = await updateOrderStatus(getParam(req.params.id), req.body);
+    const authReq = req as AuthenticatedRequest;
+    const order = await updateOrderStatus(authReq.user.id, getParam(req.params.id), req.body);
     res.json({ order });
   })
 );

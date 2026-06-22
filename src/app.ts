@@ -7,9 +7,11 @@ import { authRouter } from "./routes/auth.routes.js";
 import { brandRouter } from "./routes/brand.routes.js";
 import { cartRouter } from "./routes/cart.routes.js";
 import { categoryRouter } from "./routes/category.routes.js";
+import { departmentRouter } from "./routes/department.routes.js";
 import { adminOrderRouter, myOrderRouter, orderRouter } from "./routes/order.routes.js";
 import { myProductRouter, productRouter } from "./routes/product.routes.js";
 import { profileRouter } from "./routes/profile.routes.js";
+import { promotionRouter } from "./routes/promotion.routes.js";
 
 export function createApp() {
   const app = express();
@@ -29,6 +31,8 @@ export function createApp() {
   app.use("/me", myOrderRouter);
   app.use("/categories", categoryRouter);
   app.use("/brands", brandRouter);
+  app.use("/departments", departmentRouter);
+  app.use("/promotions", promotionRouter);
   app.use("/cart", cartRouter);
   app.use("/admin", adminCatalogRouter);
   app.use("/admin", adminOrderRouter);

@@ -1,14 +1,34 @@
+import { Prisma } from "@prisma/client";
 import { z } from "zod";
 import { HttpError } from "../lib/http.js";
+import { paginationArgs, paginationMeta, paginationQuerySchema } from "../lib/pagination.js";
 import { prisma } from "../lib/prisma.js";
-import { effectiveProductPrice } from "./product.service.js";
+import { recordInventoryMovement } from "./inventory.service.js";
+import { activePromotionWhere, calculateCartPricing, promotionPricingInclude } from "./pricing.service.js";
 
 export const checkoutSchema = z.object({
   addressId: z.string().min(1)
 });
 
 export const orderStatusSchema = z.object({
-  status: z.enum(["PENDING", "PREPARING", "ON_THE_WAY", "DELIVERED"])
+  status: z.enum(["PENDING", "PREPARING", "ON_THE_WAY", "DELIVERED", "CANCELLED"]),
+  notes: z.string().trim().max(500).optional()
+});
+
+const booleanQuerySchema = z
+  .preprocess((value) => {
+    if (value === undefined) return undefined;
+    if (value === "true" || value === true) return true;
+    if (value === "false" || value === false) return false;
+    return value;
+  }, z.boolean().optional())
+  .default(false);
+
+export const adminOrderQuerySchema = paginationQuerySchema.extend({
+  includeArchived: booleanQuerySchema,
+  status: z.enum(["PENDING", "PREPARING", "ON_THE_WAY", "DELIVERED", "CANCELLED"]).optional(),
+  search: z.string().trim().optional(),
+  date: z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/).optional()
 });
 
 const orderInclude = {
@@ -19,12 +39,23 @@ const orderInclude = {
         select: { id: true, imageUrl: true, isActive: true }
       }
     }
+  },
+  statusHistory: {
+    orderBy: { createdAt: "asc" },
+    include: {
+      changedBy: {
+        select: { id: true, name: true, email: true }
+      }
+    }
+  },
+  promotionUsages: {
+    orderBy: { createdAt: "asc" }
   }
 } as const;
 
 const allowedTransitions = {
-  PENDING: ["PREPARING"],
-  PREPARING: ["ON_THE_WAY"],
+  PENDING: ["PREPARING", "CANCELLED"],
+  PREPARING: ["ON_THE_WAY", "CANCELLED"],
   ON_THE_WAY: ["DELIVERED"],
   DELIVERED: [],
   CANCELLED: []
@@ -39,6 +70,10 @@ function mapOrder(order: any) {
       ...item,
       unitPrice: Number(item.unitPrice),
       lineTotal: Number(item.lineTotal)
+    })),
+    promotionUsages: order.promotionUsages?.map((usage: any) => ({
+      ...usage,
+      promotionalPrice: Number(usage.promotionalPrice)
     }))
   };
 }
@@ -51,19 +86,25 @@ export async function checkout(userId: string, input: unknown) {
     throw new HttpError(400, "Delivery address is required");
   }
 
-  const cartItems = await prisma.cartItem.findMany({
-    where: { userId },
-    include: {
-      product: {
-        include: {
-          category: { select: { name: true } },
-          brand: { select: { name: true } },
-          quantityPrices: { orderBy: { from: "asc" } }
+  const [cartItems, promotions] = await Promise.all([
+    prisma.cartItem.findMany({
+      where: { userId },
+      include: {
+        product: {
+          include: {
+            category: { select: { name: true } },
+            brand: { select: { name: true } },
+            quantityPrices: { orderBy: { from: "asc" } }
+          }
         }
-      }
-    },
-    orderBy: { createdAt: "asc" }
-  });
+      },
+      orderBy: { createdAt: "asc" }
+    }),
+    prisma.promotion.findMany({
+      where: activePromotionWhere(),
+      include: promotionPricingInclude
+    })
+  ]);
 
   if (cartItems.length === 0) {
     throw new HttpError(400, "Cart is empty");
@@ -79,10 +120,11 @@ export async function checkout(userId: string, input: unknown) {
     }
   }
 
-  const subtotal = cartItems.reduce(
-    (sum, item) => sum + effectiveProductPrice(item.product, item.quantity) * item.quantity,
-    0
+  const pricing = calculateCartPricing(
+    cartItems.map((item) => ({ product: item.product, quantity: item.quantity })),
+    promotions
   );
+  const pricedLinesByProductId = new Map(pricing.lines.map((line) => [line.productId, line]));
 
   const order = await prisma.$transaction(async (tx) => {
     for (const item of cartItems) {
@@ -96,12 +138,23 @@ export async function checkout(userId: string, input: unknown) {
       }
     }
 
+    for (const usage of pricing.promotionUsages) {
+      const updated = await tx.promotion.updateMany({
+        where: { id: usage.promotionId, active: true, promotionalStock: { gte: usage.quantity } },
+        data: { promotionalStock: { decrement: usage.quantity } }
+      });
+
+      if (updated.count === 0) {
+        throw new HttpError(409, `${usage.promotionName} is no longer available`);
+      }
+    }
+
     const createdOrder = await tx.order.create({
       data: {
         userId,
         addressId: address.id,
-        subtotal,
-        total: subtotal,
+        subtotal: pricing.subtotal,
+        total: pricing.total,
         addressSnapshot: {
           label: address.label,
           recipientName: address.recipientName,
@@ -113,21 +166,51 @@ export async function checkout(userId: string, input: unknown) {
         },
         items: {
           create: cartItems.map((item) => {
-            const unitPrice = effectiveProductPrice(item.product, item.quantity);
+            const pricedLine = pricedLinesByProductId.get(item.productId);
+            if (!pricedLine) {
+              throw new HttpError(500, `Missing pricing for ${item.product.name}`);
+            }
             return {
               productId: item.productId,
               productName: item.product.name,
               brandName: item.product.brand.name,
               categoryName: item.product.category.name,
-              unitPrice,
+              unitPrice: pricedLine.unitPrice,
               quantity: item.quantity,
-              lineTotal: unitPrice * item.quantity
+              lineTotal: pricedLine.lineTotal,
+              pricingSource: pricedLine.pricingSource
             };
           })
+        },
+        statusHistory: {
+          create: {
+            status: "PENDING",
+            changedByUserId: userId,
+            notes: "Pedido creado"
+          }
+        },
+        promotionUsages: {
+          create: pricing.promotionUsages.map((usage) => ({
+            promotionId: usage.promotionId,
+            promotionName: usage.promotionName,
+            quantity: usage.quantity,
+            promotionalPrice: usage.promotionalPrice
+          }))
         }
       },
       include: orderInclude
     });
+
+    for (const item of cartItems) {
+      await recordInventoryMovement(tx, {
+        productId: item.productId,
+        type: "OUT",
+        quantity: item.quantity,
+        reason: "CHECKOUT",
+        orderId: createdOrder.id,
+        changedByUserId: userId
+      });
+    }
 
     await tx.cartItem.deleteMany({ where: { userId } });
     return createdOrder;
@@ -166,6 +249,12 @@ export async function cancelMyOrder(userId: string, id: string) {
             productId: true,
             quantity: true
           }
+        },
+        promotionUsages: {
+          select: {
+            promotionId: true,
+            quantity: true
+          }
         }
       }
     });
@@ -178,20 +267,20 @@ export async function cancelMyOrder(userId: string, id: string) {
       throw new HttpError(400, "Only pending orders can be cancelled");
     }
 
-    for (const item of order.items) {
-      if (!item.productId) continue;
-
-      await tx.product.update({
-        where: { id: item.productId },
-        data: { stock: { increment: item.quantity } }
-      });
-    }
+    await releaseOrderAllocations(tx, order, userId, "CUSTOMER_CANCELLED");
 
     return tx.order.update({
       where: { id },
       data: {
         status: "CANCELLED",
-        archivedAt: new Date()
+        archivedAt: new Date(),
+        statusHistory: {
+          create: {
+            status: "CANCELLED",
+            changedByUserId: userId,
+            notes: "Cancelado por el cliente"
+          }
+        }
       },
       include: orderInclude
     });
@@ -200,14 +289,34 @@ export async function cancelMyOrder(userId: string, id: string) {
   return mapOrder(updated);
 }
 
-export async function listAdminOrders(includeArchived: boolean) {
-  const orders = await prisma.order.findMany({
-    where: includeArchived ? undefined : { archivedAt: null },
-    include: orderInclude,
-    orderBy: { createdAt: "desc" }
-  });
+export async function listAdminOrders(query: unknown) {
+  const filters = adminOrderQuerySchema.parse(query);
+  const searchOrderIds = filters.search ? await orderIdsBySearch(filters.search) : undefined;
+  const where: Prisma.OrderWhereInput = {
+    archivedAt: filters.includeArchived ? undefined : null,
+    status: filters.status,
+    id: searchOrderIds ? { in: searchOrderIds } : undefined,
+    createdAt: filters.date
+      ? {
+          gte: new Date(`${filters.date}T00:00:00.000Z`),
+          lte: new Date(`${filters.date}T23:59:59.999Z`)
+        }
+      : undefined
+  };
+  const [total, orders] = await prisma.$transaction([
+    prisma.order.count({ where }),
+    prisma.order.findMany({
+      where,
+      include: orderInclude,
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      ...paginationArgs(filters)
+    })
+  ]);
 
-  return orders.map(mapOrder);
+  return {
+    orders: orders.map(mapOrder),
+    pagination: paginationMeta(total, filters)
+  };
 }
 
 export async function getAdminOrder(id: string) {
@@ -220,34 +329,102 @@ export async function getAdminOrder(id: string) {
   return mapOrder(order);
 }
 
-export async function updateOrderStatus(id: string, input: unknown) {
+export async function updateOrderStatus(adminUserId: string, id: string, input: unknown) {
   const data = orderStatusSchema.parse(input);
-  const order = await prisma.order.findUnique({ where: { id } });
+  const updated = await prisma.$transaction(async (tx) => {
+    const order = await tx.order.findUnique({
+      where: { id },
+      include: {
+        items: {
+          select: {
+            productId: true,
+            quantity: true
+          }
+        },
+        promotionUsages: {
+          select: {
+            promotionId: true,
+            quantity: true
+          }
+        }
+      }
+    });
 
-  if (!order) {
-    throw new HttpError(404, "Order not found");
-  }
+    if (!order) {
+      throw new HttpError(404, "Order not found");
+    }
 
-  const nextStatuses = allowedTransitions[order.status];
-  if (!nextStatuses.includes(data.status as never)) {
-    throw new HttpError(400, "Invalid order status transition");
-  }
+    const nextStatuses = allowedTransitions[order.status];
+    if (!nextStatuses.includes(data.status as never)) {
+      throw new HttpError(400, "Invalid order status transition");
+    }
 
-  const updated = await prisma.order.update({
-    where: { id },
-    data: {
-      status: data.status,
-      archivedAt: data.status === "DELIVERED" ? new Date() : null
-    },
-    include: orderInclude
+    if (data.status === "CANCELLED") {
+      await releaseOrderAllocations(tx, order, adminUserId, "ADMIN_CANCELLED");
+    }
+
+    return tx.order.update({
+      where: { id },
+      data: {
+        status: data.status,
+        archivedAt: data.status === "DELIVERED" || data.status === "CANCELLED" ? new Date() : null,
+        statusHistory: {
+          create: {
+            status: data.status,
+            changedByUserId: adminUserId,
+            notes: data.notes ?? null
+          }
+        }
+      },
+      include: orderInclude
+    });
   });
 
   return mapOrder(updated);
 }
 
+async function releaseOrderAllocations(
+  tx: Prisma.TransactionClient,
+  order: {
+    id: string;
+    items: Array<{ productId: string | null; quantity: number }>;
+    promotionUsages: Array<{ promotionId: string | null; quantity: number }>;
+  },
+  changedByUserId: string,
+  reason: string
+) {
+  for (const item of order.items) {
+    if (!item.productId) continue;
+
+    await tx.product.update({
+      where: { id: item.productId },
+      data: { stock: { increment: item.quantity } }
+    });
+
+    await recordInventoryMovement(tx, {
+      productId: item.productId,
+      type: "RELEASED",
+      quantity: item.quantity,
+      reason,
+      orderId: order.id,
+      changedByUserId
+    });
+  }
+
+  for (const usage of order.promotionUsages) {
+    if (!usage.promotionId) continue;
+
+    await tx.promotion.update({
+      where: { id: usage.promotionId },
+      data: { promotionalStock: { increment: usage.quantity } }
+    });
+  }
+}
+
 export async function getOrderVoucherHtml(id: string) {
   const order = await getAdminOrder(id);
   const address = order.addressSnapshot as Record<string, string>;
+  const notes = order.statusHistory?.filter((entry: any) => entry.notes).at(-1)?.notes;
   const rows = order.items
     .map(
       (item: any) => `
@@ -299,6 +476,7 @@ export async function getOrderVoucherHtml(id: string) {
       <p>${escapeHtml(address.street ?? "")}</p>
       <p>${escapeHtml(address.city ?? "")}, ${escapeHtml(address.province ?? "")} (${escapeHtml(address.postalCode ?? "")})</p>
       <p>Telefono: ${escapeHtml(address.phone ?? "")}</p>
+      ${notes ? `<p>Observaciones: ${escapeHtml(notes)}</p>` : ""}
     </section>
     <section>
       <h2>Productos</h2>
@@ -312,6 +490,22 @@ export async function getOrderVoucherHtml(id: string) {
 
 function formatMoney(value: number) {
   return value.toLocaleString("es-AR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+async function orderIdsBySearch(search: string) {
+  const pattern = `%${search}%`;
+  const rows = await prisma.$queryRaw<Array<{ id: string }>>`
+    SELECT DISTINCT o."id"
+    FROM "Order" o
+    LEFT JOIN "OrderItem" oi ON oi."orderId" = o."id"
+    WHERE o."id" ILIKE ${pattern}
+       OR o."addressSnapshot"::text ILIKE ${pattern}
+       OR oi."productName" ILIKE ${pattern}
+       OR oi."brandName" ILIKE ${pattern}
+       OR oi."categoryName" ILIKE ${pattern}
+  `;
+
+  return rows.map((row) => row.id);
 }
 
 function escapeHtml(value: string) {

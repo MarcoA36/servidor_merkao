@@ -15,6 +15,7 @@ import {
   listAdminBrands,
   listAdminCategories,
   listAdminDepartments,
+  listAdminInventoryMovements,
   listAdminProducts,
   listAdminPromotions,
   updateAdminBrand,
@@ -22,7 +23,8 @@ import {
   updateAdminDepartment,
   updateAdminInventory,
   updateAdminProduct,
-  updateAdminPromotion
+  updateAdminPromotion,
+  updateAdminPromotionStatus
 } from "../services/admin-catalog.service.js";
 
 export const adminCatalogRouter = Router();
@@ -93,9 +95,9 @@ adminCatalogRouter.delete("/brands/:id", asyncHandler(async (req, res) => {
   res.status(204).send();
 }));
 
-adminCatalogRouter.get("/products", asyncHandler(async (_req, res) => {
-  const products = await listAdminProducts();
-  res.json({ products });
+adminCatalogRouter.get("/products", asyncHandler(async (req, res) => {
+  const result = await listAdminProducts(req.query);
+  res.json(result);
 }));
 
 adminCatalogRouter.post("/products", asyncHandler(async (req, res) => {
@@ -105,13 +107,20 @@ adminCatalogRouter.post("/products", asyncHandler(async (req, res) => {
 }));
 
 adminCatalogRouter.put("/products/:id", asyncHandler(async (req, res) => {
-  const product = await updateAdminProduct(getParam(req.params.id), req.body);
+  const authReq = req as AuthenticatedRequest;
+  const product = await updateAdminProduct(authReq.user.id, getParam(req.params.id), req.body);
   res.json({ product });
 }));
 
 adminCatalogRouter.patch("/products/:id/inventory", asyncHandler(async (req, res) => {
-  const product = await updateAdminInventory(getParam(req.params.id), req.body);
+  const authReq = req as AuthenticatedRequest;
+  const product = await updateAdminInventory(authReq.user.id, getParam(req.params.id), req.body);
   res.json({ product });
+}));
+
+adminCatalogRouter.get("/inventory-movements", asyncHandler(async (req, res) => {
+  const result = await listAdminInventoryMovements(req.query);
+  res.json(result);
 }));
 
 adminCatalogRouter.delete("/products/:id", asyncHandler(async (req, res) => {
@@ -119,9 +128,9 @@ adminCatalogRouter.delete("/products/:id", asyncHandler(async (req, res) => {
   res.status(204).send();
 }));
 
-adminCatalogRouter.get("/promotions", asyncHandler(async (_req, res) => {
-  const promotions = await listAdminPromotions();
-  res.json({ promotions });
+adminCatalogRouter.get("/promotions", asyncHandler(async (req, res) => {
+  const result = await listAdminPromotions(req.query);
+  res.json(result);
 }));
 
 adminCatalogRouter.post("/promotions", asyncHandler(async (req, res) => {
@@ -131,6 +140,11 @@ adminCatalogRouter.post("/promotions", asyncHandler(async (req, res) => {
 
 adminCatalogRouter.put("/promotions/:id", asyncHandler(async (req, res) => {
   const promotion = await updateAdminPromotion(getParam(req.params.id), req.body);
+  res.json({ promotion });
+}));
+
+adminCatalogRouter.patch("/promotions/:id/status", asyncHandler(async (req, res) => {
+  const promotion = await updateAdminPromotionStatus(getParam(req.params.id), req.body);
   res.json({ promotion });
 }));
 

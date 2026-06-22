@@ -2,6 +2,8 @@ import { Prisma } from "@prisma/client";
 import { z } from "zod";
 import { HttpError } from "../lib/http.js";
 import { prisma } from "../lib/prisma.js";
+import { recordInventoryMovement, stockAdjustmentQuantity } from "./inventory.service.js";
+import { activePromotionWhere, calculateCartPricing, calculateProductUnitPrice, promotionPricingInclude } from "./pricing.service.js";
 
 export const imageUrlSchema = z
   .string()
@@ -22,18 +24,35 @@ export const productSchema = z.object({
   name: z.string().trim().min(2).max(120),
   description: z.string().trim().min(5).max(1000),
   price: z.coerce.number().positive().max(99999999),
-  promotionalPrice: z.coerce.number().positive().max(99999999).nullable().optional(),
   quantityPrices: z
     .array(quantityPriceRangeSchema)
     .max(20)
     .default([])
     .superRefine((ranges, context) => {
-      for (const range of ranges) {
+      for (const [index, range] of ranges.entries()) {
         if (range.to !== null && range.to !== undefined && range.to < range.from) {
           context.addIssue({
             code: z.ZodIssueCode.custom,
             message: "Range end must be greater than or equal to range start",
-            path: ["to"]
+            path: [index, "to"]
+          });
+        }
+      }
+
+      const sortedRanges = ranges
+        .map((range, index) => ({ ...range, index }))
+        .sort((left, right) => left.from - right.from);
+
+      for (let index = 1; index < sortedRanges.length; index += 1) {
+        const previous = sortedRanges[index - 1];
+        const current = sortedRanges[index];
+        const previousEnd = previous.to ?? Number.POSITIVE_INFINITY;
+
+        if (current.from <= previousEnd) {
+          context.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: "Quantity price ranges cannot overlap",
+            path: [current.index, "from"]
           });
         }
       }
@@ -64,17 +83,30 @@ const productInclude = {
   category: { select: { id: true, name: true, slug: true, imageUrl: true, departmentId: true } },
   brand: { select: { id: true, name: true, slug: true, imageUrl: true } },
   owner: { select: { id: true, name: true } },
-  quantityPrices: { orderBy: { from: "asc" } }
+  quantityPrices: { orderBy: { from: "asc" } },
+  promotionItems: {
+    include: {
+      promotion: {
+        include: promotionPricingInclude
+      }
+    }
+  }
 } satisfies Prisma.ProductInclude;
 
 type ProductWithRelations = Prisma.ProductGetPayload<{ include: typeof productInclude }>;
 
 function mapProduct(product: ProductWithRelations) {
+  const { promotionItems, ...rest } = product;
+  const pricing = calculateCartPricing(
+    [{ product, quantity: 1 }],
+    promotionItems.map((item) => item.promotion)
+  );
+  const effectivePrice = pricing.lines[0]?.unitPrice ?? Number(product.price);
+
   return {
-    ...product,
+    ...rest,
     price: Number(product.price),
-    promotionalPrice: product.promotionalPrice ? Number(product.promotionalPrice) : null,
-    effectivePrice: Number(product.promotionalPrice ?? product.price),
+    effectivePrice,
     quantityPrices: product.quantityPrices.map((range) => ({
       ...range,
       price: Number(range.price)
@@ -83,11 +115,10 @@ function mapProduct(product: ProductWithRelations) {
 }
 
 export function effectiveProductPrice(
-  product: { price: unknown; promotionalPrice: unknown; quantityPrices?: Array<{ from: number; to: number | null; price: unknown }> },
+  product: { price: unknown; quantityPrices?: Array<{ from: number; to: number | null; price: unknown }> },
   quantity = 1
 ) {
-  const quantityRange = product.quantityPrices?.find((range) => quantity >= range.from && (range.to === null || quantity <= range.to));
-  return Number(quantityRange?.price ?? product.promotionalPrice ?? product.price);
+  return calculateProductUnitPrice({ id: "product", ...product }, quantity);
 }
 
 export async function listProducts(query: unknown) {
@@ -96,7 +127,7 @@ export async function listProducts(query: unknown) {
     isActive: true,
     categoryId: filters.categoryId,
     brandId: filters.brandId,
-    promotionalPrice: filters.promotionalOnly ? { not: null } : undefined,
+    promotionItems: filters.promotionalOnly ? { some: { promotion: activePromotionWhere() } } : undefined,
     OR: filters.search
       ? [
           { name: { contains: filters.search, mode: "insensitive" } },
@@ -159,26 +190,39 @@ export async function createProduct(ownerId: string, input: unknown) {
   const data = productSchema.parse(input);
   await assertCategoryAndBrand(data.categoryId, data.brandId);
 
-  const product = await prisma.product.create({
-    data: {
-      name: data.name,
-      description: data.description,
-      price: data.price,
-      promotionalPrice: data.promotionalPrice ?? null,
-      stock: data.stock,
-      imageUrl: data.imageUrl,
-      categoryId: data.categoryId,
-      brandId: data.brandId,
-      ownerId,
-      quantityPrices: {
-        create: data.quantityPrices.map((range) => ({
-          from: range.from,
-          to: range.to ?? null,
-          price: range.price
-        }))
-      }
-    },
-    include: productInclude
+  const product = await prisma.$transaction(async (tx) => {
+    const created = await tx.product.create({
+      data: {
+        name: data.name,
+        description: data.description,
+        price: data.price,
+        stock: data.stock,
+        imageUrl: data.imageUrl,
+        categoryId: data.categoryId,
+        brandId: data.brandId,
+        ownerId,
+        quantityPrices: {
+          create: data.quantityPrices.map((range) => ({
+            from: range.from,
+            to: range.to ?? null,
+            price: range.price
+          }))
+        }
+      },
+      include: productInclude
+    });
+
+    if (data.stock > 0) {
+      await recordInventoryMovement(tx, {
+        productId: created.id,
+        type: "IN",
+        quantity: data.stock,
+        reason: "INITIAL_STOCK",
+        changedByUserId: ownerId
+      });
+    }
+
+    return created;
   });
 
   return mapProduct(product);
@@ -200,13 +244,12 @@ export async function updateProduct(ownerId: string, id: string, input: unknown)
 
   const product = await prisma.$transaction(async (tx) => {
     await tx.quantityPriceRange.deleteMany({ where: { productId: id } });
-    return tx.product.update({
+    const updated = await tx.product.update({
       where: { id },
       data: {
         name: data.name,
         description: data.description,
         price: data.price,
-        promotionalPrice: data.promotionalPrice ?? null,
         stock: data.stock,
         imageUrl: data.imageUrl,
         categoryId: data.categoryId,
@@ -221,6 +264,19 @@ export async function updateProduct(ownerId: string, id: string, input: unknown)
       },
       include: productInclude
     });
+
+    const stockDelta = stockAdjustmentQuantity(existing.stock, data.stock);
+    if (stockDelta !== 0) {
+      await recordInventoryMovement(tx, {
+        productId: id,
+        type: "ADJUSTMENT",
+        quantity: stockDelta,
+        reason: "PRODUCT_UPDATE",
+        changedByUserId: ownerId
+      });
+    }
+
+    return updated;
   });
 
   return mapProduct(product);

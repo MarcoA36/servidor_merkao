@@ -39,7 +39,7 @@ type ProductSeedInput = {
   name: string;
   description: string;
   price: string;
-  promotionalPrice: string | null;
+  promoPrice: string | null;
   stock: number;
   imageUrl: string;
   categorySlug: string;
@@ -191,7 +191,7 @@ const products: ProductSeedInput[] = Object.entries(catalogByCategory).flatMap(
       name: item.name,
       description: categoryDescriptions[categorySlug],
       price: item.price.toFixed(2),
-      promotionalPrice: item.promo ? item.promo.toFixed(2) : null,
+      promoPrice: item.promo ? item.promo.toFixed(2) : null,
       stock: item.stock,
       imageUrl: productImageUrl(item.name),
       categorySlug,
@@ -302,7 +302,6 @@ async function main() {
     const data = {
       description: product.description,
       price: product.price,
-      promotionalPrice: product.promotionalPrice,
       stock: product.stock,
       imageUrl: product.imageUrl,
       categoryId: category.id,
@@ -310,18 +309,50 @@ async function main() {
       isActive: true
     };
 
-    if (existing) {
-      await prisma.product.update({
+    const savedProduct = existing
+      ? await prisma.product.update({
         where: { id: existing.id },
         data
-      });
-    } else {
-      await prisma.product.create({
+      })
+      : await prisma.product.create({
         data: {
           name: product.name,
           ...data,
           ownerId: user.id
         }
+      });
+
+    if (product.promoPrice) {
+      const promotionId = `seed_product_promo_${savedProduct.id}`;
+      await prisma.promotion.upsert({
+        where: { id: promotionId },
+        update: {
+          name: `Promo ${savedProduct.name}`,
+          promotionalPrice: product.promoPrice,
+          promotionalStock: Math.max(savedProduct.stock, 1),
+          active: true,
+          priority: "NORMAL"
+        },
+        create: {
+          id: promotionId,
+          name: `Promo ${savedProduct.name}`,
+          promotionalPrice: product.promoPrice,
+          promotionalStock: Math.max(savedProduct.stock, 1),
+          active: true,
+          priority: "NORMAL",
+          items: {
+            create: {
+              productId: savedProduct.id,
+              quantity: 1
+            }
+          }
+        }
+      });
+
+      await prisma.promotionItem.upsert({
+        where: { promotionId_productId: { promotionId, productId: savedProduct.id } },
+        update: { quantity: 1 },
+        create: { promotionId, productId: savedProduct.id, quantity: 1 }
       });
     }
   }

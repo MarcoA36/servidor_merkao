@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import bcrypt from "bcryptjs";
 import { z } from "zod";
 import { signToken } from "../lib/auth.js";
@@ -15,9 +16,16 @@ export const loginSchema = z.object({
   password: z.string().min(1).max(120)
 });
 
-function toAuthResponse(user: { id: string; name: string; email: string; role: "CUSTOMER" | "ADMIN" }) {
+export const refreshTokenSchema = z.object({
+  refreshToken: z.string().min(32).max(256)
+});
+
+const refreshTokenDays = 30;
+
+async function toAuthResponse(user: { id: string; name: string; email: string; role: "CUSTOMER" | "ADMIN" }) {
   return {
     token: signToken({ sub: user.id, email: user.email, role: user.role }),
+    refreshToken: await createRefreshToken(user.id),
     user
   };
 }
@@ -64,4 +72,81 @@ export async function login(input: unknown) {
     email: user.email,
     role: user.role
   });
+}
+
+export async function refresh(input: unknown) {
+  const data = refreshTokenSchema.parse(input);
+  const tokenHash = hashToken(data.refreshToken);
+
+  const existing = await prisma.refreshToken.findUnique({
+    where: { tokenHash },
+    include: {
+      user: {
+        select: { id: true, name: true, email: true, role: true }
+      }
+    }
+  });
+
+  if (!existing || existing.revokedAt || existing.expiresAt <= new Date()) {
+    throw new HttpError(401, "Invalid refresh token");
+  }
+
+  return prisma.$transaction(async (tx) => {
+    await tx.refreshToken.update({
+      where: { id: existing.id },
+      data: { revokedAt: new Date() }
+    });
+
+    const refreshToken = generateRefreshToken();
+    await tx.refreshToken.create({
+      data: {
+        userId: existing.userId,
+        tokenHash: hashToken(refreshToken),
+        expiresAt: refreshExpiry()
+      }
+    });
+
+    return {
+      token: signToken({ sub: existing.user.id, email: existing.user.email, role: existing.user.role }),
+      refreshToken,
+      user: existing.user
+    };
+  });
+}
+
+export async function logout(input: unknown) {
+  const data = refreshTokenSchema.parse(input);
+  await prisma.refreshToken.updateMany({
+    where: {
+      tokenHash: hashToken(data.refreshToken),
+      revokedAt: null
+    },
+    data: { revokedAt: new Date() }
+  });
+}
+
+async function createRefreshToken(userId: string) {
+  const refreshToken = generateRefreshToken();
+  await prisma.refreshToken.create({
+    data: {
+      userId,
+      tokenHash: hashToken(refreshToken),
+      expiresAt: refreshExpiry()
+    }
+  });
+  return refreshToken;
+}
+
+function generateRefreshToken() {
+  return crypto.randomBytes(48).toString("base64url");
+}
+
+function hashToken(token: string) {
+  return crypto.createHash("sha256").update(token).digest("hex");
+}
+
+function refreshExpiry() {
+  const expiresAt = new Date();
+  expiresAt.setDate(expiresAt.getDate() + refreshTokenDays);
+  return expiresAt;
 }

@@ -21,6 +21,15 @@ cartRouter.get(
 );
 
 cartRouter.post(
+  "/recalculate",
+  asyncHandler(async (req, res) => {
+    const authReq = req as AuthenticatedRequest;
+    const cart = await getCart(authReq.user.id);
+    res.json({ cart });
+  })
+);
+
+cartRouter.post(
   "/items",
   asyncHandler(async (req, res) => {
     const authReq = req as AuthenticatedRequest;

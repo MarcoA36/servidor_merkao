@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { HttpError } from "../lib/http.js";
 import { prisma } from "../lib/prisma.js";
-import { effectiveProductPrice } from "./product.service.js";
+import { activePromotionWhere, calculateCartPricing, promotionPricingInclude, type PromotionForPricing } from "./pricing.service.js";
 
 export const cartItemSchema = z.object({
   productId: z.string().min(1),
@@ -23,19 +23,26 @@ const cartInclude = {
   }
 } as const;
 
-function mapCart(items: Array<Awaited<ReturnType<typeof prisma.cartItem.findMany>>[number] & { product: any }>) {
+function mapCart(items: Array<Awaited<ReturnType<typeof prisma.cartItem.findMany>>[number] & { product: any }>, promotions: PromotionForPricing[]) {
+  const pricing = calculateCartPricing(
+    items.map((item) => ({ product: item.product, quantity: item.quantity })),
+    promotions
+  );
+  const linesByProductId = new Map(pricing.lines.map((line) => [line.productId, line]));
   const mappedItems = items.map((item) => {
-    const unitPrice = effectiveProductPrice(item.product, item.quantity);
+    const pricedLine = linesByProductId.get(item.productId);
+    const unitPrice = pricedLine?.unitPrice ?? Number(item.product.price);
+    const lineTotal = pricedLine?.lineTotal ?? unitPrice * item.quantity;
     return {
       id: item.id,
       productId: item.productId,
       quantity: item.quantity,
       unitPrice,
-      lineTotal: unitPrice * item.quantity,
+      lineTotal,
+      pricingSource: pricedLine?.pricingSource ?? "BASE",
       product: {
         ...item.product,
         price: Number(item.product.price),
-        promotionalPrice: item.product.promotionalPrice ? Number(item.product.promotionalPrice) : null,
         effectivePrice: unitPrice,
         quantityPrices: item.product.quantityPrices.map((range: any) => ({
           ...range,
@@ -45,18 +52,23 @@ function mapCart(items: Array<Awaited<ReturnType<typeof prisma.cartItem.findMany
     };
   });
 
-  const subtotal = mappedItems.reduce((sum, item) => sum + item.lineTotal, 0);
-  return { items: mappedItems, subtotal, total: subtotal };
+  return { items: mappedItems, subtotal: pricing.subtotal, total: pricing.total };
 }
 
 export async function getCart(userId: string) {
-  const items = await prisma.cartItem.findMany({
-    where: { userId },
-    include: cartInclude,
-    orderBy: { createdAt: "desc" }
-  });
+  const [items, promotions] = await Promise.all([
+    prisma.cartItem.findMany({
+      where: { userId },
+      include: cartInclude,
+      orderBy: { createdAt: "desc" }
+    }),
+    prisma.promotion.findMany({
+      where: activePromotionWhere(),
+      include: promotionPricingInclude
+    })
+  ]);
 
-  return mapCart(items);
+  return mapCart(items, promotions);
 }
 
 export async function addCartItem(userId: string, input: unknown) {
